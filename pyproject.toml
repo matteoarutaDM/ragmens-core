@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ragmens-core"
+version = "0.1.0"
+description = "Core RAG riusabile: PDF ingestion, chunking, FAISS indexing e retrieval."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "faiss-cpu>=1.8.0",
+    "numpy>=1.24",
+    "pypdf>=4.0",
+    "python-dotenv>=1.0",
+    "sentence-transformers>=2.7",
+    "tqdm>=4.66",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
