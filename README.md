@@ -14,13 +14,64 @@ La libreria non contiene la parte LLM. Prompt, chiamate OpenAI/Ollama, FastAPI, 
 
 ## 1. Installazione
 
-Dalla cartella del progetto:
+### Installazione da GitHub
+
+Nel progetto dove vuoi usare la libreria:
+
+```bash
+python3 -m pip install git+https://github.com/matteoarutaDM/ragmens-core.git
+```
+
+Poi verifica che l'import funzioni:
+
+```bash
+python3 -c "from ragmens_core import RagConfig, RagIndex; print('ragmens-core ok')"
+```
+
+Nel codice Python puoi importarla cosi:
+
+```python
+from ragmens_core import RagConfig, RagIndex
+```
+
+### Installazione locale in sviluppo
+
+Se hai clonato questa repository e vuoi modificarla, entra nella cartella del repo:
 
 ```bash
 pip install -e .
 ```
 
 `-e` significa "editable": se modifichi i file dentro `src/ragmens_core/`, Python usa subito la versione aggiornata senza reinstallare.
+
+### Installazione dentro Jupyter o notebook
+
+Se `pip install ...` dal terminale sembra riuscire ma nel notebook ottieni:
+
+```text
+ModuleNotFoundError: No module named 'ragmens_core'
+```
+
+allora il notebook sta usando un Python diverso da quello del terminale. In questo caso installa la libreria direttamente dal notebook con `sys.executable`:
+
+```python
+import sys
+!{sys.executable} -m pip install git+https://github.com/matteoarutaDM/ragmens-core.git
+```
+
+Poi riavvia il kernel e verifica:
+
+```python
+from ragmens_core import RagConfig, RagIndex
+print("ragmens-core ok")
+```
+
+Per vedere quale Python usa il notebook:
+
+```python
+import sys
+print(sys.executable)
+```
 
 ## 2. Struttura della libreria
 
