@@ -119,6 +119,26 @@ context = rag.build_context(hits)
 print(context)
 ```
 
+## 3.3 Uso minimo consigliato con installazione da script
+
+
+
+```python
+import sys
+!{sys.executable} -m pip install git+https://github.com/matteoarutaDM/ragmens-core.git
+
+from ragmens_core import RagConfig, RagIndex
+
+config = RagConfig.from_env()
+rag = RagIndex.prepare(config)
+
+domanda = "come verifico il corretto funzionamento della pompa idraulica?"
+hits = rag.retrieve(domanda, top_k=5)
+context = rag.build_context(hits)
+
+print(context)
+```
+
 Cosa succede:
 
 1. `RagConfig.from_env()` legge configurazione e percorsi.
