@@ -119,9 +119,7 @@ context = rag.build_context(hits)
 print(context)
 ```
 
-## 3.3 Uso minimo consigliato con installazione da script
-
-
+## 3.1 Uso minimo consigliato con installazione da script
 
 ```python
 import sys
@@ -145,6 +143,169 @@ Cosa succede:
 2. `RagIndex.prepare(config)` carica o crea chunks e indice FAISS.
 3. `rag.retrieve(...)` cerca i chunk piu rilevanti.
 4. `rag.build_context(...)` trasforma i risultati in testo pronto per il prompt LLM.
+
+
+
+## 3.2 Uso minimo consigliato con LLM
+
+```python
+# ============================================================
+# 1) RAG CORE DA LIBRERIA
+# ============================================================
+
+from __future__ import annotations
+
+from typing import Dict, List
+
+from ragmens_core import RagConfig, RagIndex, ShortTermMemory, VectorMemory, ltm_text
+
+
+config = RagConfig.from_env()
+rag = RagIndex.prepare(config)
+stm = ShortTermMemory(max_messages=10)
+ltm = VectorMemory(
+    embedder=rag.embedder,
+    mem_dir=config.mem_dir,
+    corpus_signature=rag.corpus_signature,
+)
+
+# ============================================================
+# 2) GENERATION LLM - PROMPT COME NEL NOTEBOOK ORIGINALE
+# ============================================================
+
+from openai import OpenAI
+
+
+LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
+
+
+QA_PROMPT = """Sei un assistente virtuale esperto della conoscenza e conrtesto dei pdf.
+
+Personalita e stile:
+- Rispondi sempre in italiano.
+- Mantieni un tono amichevole, naturale, professionale e disponibile.
+- Se l'utente saluta, ringrazia, chiede come stai, fa conversazione generica o pone una domanda amichevole, rispondi in modo cordiale e umano, senza forzare riferimenti tecnici.
+- Non essere freddo o meccanico: usa frasi semplici, dirette e collaborative.
+- Evita risposte troppo lunghe quando la domanda e semplice.
+- Quando la domanda e tecnica, resta preciso, ordinato e concreto.
+
+Uso del contesto:
+- Usa il CONTEXT come fonte principale quando contiene informazioni rilevanti.
+- Se il CONTEXT contiene fonti, pagine o chunk utili, integra la risposta con quelle informazioni.
+- Se il CONTEXT non contiene abbastanza informazioni per rispondere completamente, non dire in modo esplicito e secco che l'informazione non e presente nel contesto.
+- In assenza di informazioni sufficienti nel CONTEXT, costruisci comunque una risposta utile basandoti sulla tua conoscenza generale, mantenendo un tono prudente e professionale.
+- Quando usi conoscenza generale non supportata direttamente dal CONTEXT, evita affermazioni troppo assolute e formula la risposta come indicazione generale.
+- Non inventare nomi di schermate, menu, percorsi, campi o configurazioni specifiche se non sono nel CONTEXT o non sono ragionevolmente noti.
+- Se una risposta richiede dati specifici dell'ambiente del cliente, spiega in modo amichevole cosa verificare o quali informazioni servirebbero.
+
+Qualita della risposta:
+- Dai prima la risposta pratica, poi eventuali dettagli.
+- Per procedure operative, usa passaggi chiari e numerati.
+- Per concetti o definizioni, usa una spiegazione breve seguita da esempi se utili.
+- Per domande ambigue, rispondi con l'interpretazione piu probabile e, se serve, chiedi una precisazione alla fine.
+- Se l'utente chiede un confronto, struttura la risposta in punti o tabella testuale semplice.
+- Se l'utente chiede una configurazione NetSuite, evidenzia prerequisiti, percorso operativo e risultato atteso quando possibile.
+- Mantieni risposte concise ma complete: evita testo superfluo, ma non omettere passaggi importanti.
+
+Citazioni e fonti:
+- Cita le fonti quando nel CONTEXT sono disponibili riferimenti a Fonte, Pagina o Chunk.
+- Non citare fonti inesistenti.
+- Se stai rispondendo a una domanda amichevole o generale non tecnica, non serve citare fonti.
+
+MEMORIA BREVE:
+{stm}
+
+MEMORIA LUNGA RILEVANTE:
+{ltm}
+
+CONTEXT:
+{context}
+
+DOMANDA:
+{question}
+
+RISPOSTA (in italiano, chiara, strutturata e professionale):"""
+
+
+def build_prompt(question: str, context: str, memory_hits: List[dict]) -> str:
+    return QA_PROMPT.format(
+        stm=stm.text(),
+        ltm=ltm_text(memory_hits),
+        context=context,
+        question=question,
+    )
+
+
+def call_llm(prompt: str) -> str:
+    client = OpenAI(api_key=OPENAI_API_KEY, base_url=LLM_BASE_URL)
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def ask(
+    question: str,
+    top_k: int | None = None,
+    document_ids: List[str] | None = None,
+    save_memory: bool = True,
+) -> Dict[str, object]:
+    hits = rag.retrieve(question, top_k=top_k, document_ids=document_ids)
+    context = rag.build_context(hits)
+    memory_hits = ltm.search(SESSION_ID, question, top_k=4)
+    prompt = build_prompt(question, context, memory_hits)
+    answer = call_llm(prompt)
+
+    stm.add("user", question)
+    stm.add("assistant", answer)
+    if save_memory:
+        ltm.add_turn(SESSION_ID, question, answer)
+
+    print("\n=== RISPOSTA ===\n")
+    print(answer)
+    print("\n=== FONTI RECUPERATE ===")
+    for hit in hits:
+        print(f"- {hit['source']} | pagina {hit['page']} | chunk {hit['chunk_index']} | score {hit['score']:.3f}")
+
+    return {
+        "question": question,
+        "answer": answer,
+        "hits": hits,
+        "context": context,
+        "memory_hits": memory_hits,
+        "prompt": prompt,
+    }
+
+
+def chat_loop() -> None:
+    print("Chat RAG pronta. Scrivi una domanda oppure 'exit' per uscire.")
+    while True:
+        question = input("\nDomanda> ").strip()
+        if question.lower() in {"exit", "quit", "q"}:
+            break
+        if question:
+            ask(question)
+
+
+print("LLM configurato:", LLM_MODEL, "@", LLM_BASE_URL)
+
+# ============================================================
+# 3) DOMANDA DI PROVA
+# ============================================================
+
+DOMANDA = """
+come verifico il corretto funzionamento della pompa idraulica?
+""".strip()
+
+risultato = ask(DOMANDA)
+risposta_llm = risultato["answer"]
+```
+
+
 
 ## 4. Variabili ambiente supportate
 
