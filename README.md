@@ -1,872 +1,182 @@
 # ragmens-core
 
-`ragmens-core` e una libreria Python per riusare la parte RAG stabile dei progetti:
+`ragmens-core` è una libreria Python modulare per acquisire documenti, cercarne i passaggi pertinenti e ottenere risposte da un LLM esterno. Lo stack predefinito è **Docling → HybridChunker → Qwen3-Embedding-4B → Qdrant → Ollama/qwen3:14b**. Importare il pacchetto non carica modelli e non invia richieste.
 
-- lettura PDF
-- pulizia testo
-- chunking
-- creazione o caricamento indice FAISS
-- retrieval semantico
-- costruzione del contesto da passare a un LLM
-- memoria conversazionale opzionale
-
-La libreria non contiene la parte LLM. Prompt, chiamate OpenAI/Ollama, FastAPI, frontend e logica di chat restano nel progetto applicativo.
-
-## 1. Installazione
-
-### Installazione da GitHub
-
-Nel progetto dove vuoi usare la libreria:
-
-```bash
-python3 -m pip install git+https://github.com/matteoarutaDM/ragmens-core.git
-```
-
-Poi verifica che l'import funzioni:
-
-```bash
-python3 -c "from ragmens_core import RagConfig, RagIndex; print('ragmens-core ok')"
-```
-
-Nel codice Python puoi importarla cosi:
-
-```python
-from ragmens_core import RagConfig, RagIndex
-```
-
-### Installazione locale in sviluppo
-
-Se hai clonato questa repository e vuoi modificarla, entra nella cartella del repo:
-
-```bash
-pip install -e .
-```
-
-`-e` significa "editable": se modifichi i file dentro `src/ragmens_core/`, Python usa subito la versione aggiornata senza reinstallare.
-
-### Installazione dentro Jupyter o notebook
-
-Se `pip install ...` dal terminale sembra riuscire ma nel notebook ottieni:
+## Funzionalità e architettura
 
 ```text
-ModuleNotFoundError: No module named 'ragmens_core'
+OFFLINE  documenti → Docling → JSON → ftfy → HybridChunker → Qwen embedding → Qdrant
+                                  └──── cache versionata e checksum ────────────┘
+ONLINE   domanda → Qwen query embedding → Qdrant → fonti → contesto + memoria
+                                                            → prompt → Ollama → risposta
 ```
 
-allora il notebook sta usando un Python diverso da quello del terminale. In questo caso installa la libreria direttamente dal notebook con `sys.executable`:
+Docling conserva struttura, tabelle e provenienza PDF. I documenti testuali sono adattati a Docling. HybridChunker produce testi contestualizzati e il tokenizer dell'embedder verifica il limite. Qdrant esegue ricerca coseno e filtri sulle fonti. La pipeline include cache verificata, citazioni, memoria opzionale, generazione e streaming.
 
-```python
-import sys
-!{sys.executable} -m pip install git+https://github.com/matteoarutaDM/ragmens-core.git
-```
-
-Poi riavvia il kernel e verifica:
-
-```python
-from ragmens_core import RagConfig, RagIndex
-print("ragmens-core ok")
-```
-
-Per vedere quale Python usa il notebook:
-
-```python
-import sys
-print(sys.executable)
-```
-
-## 2. Struttura della libreria
-
-Il file `pyproject.toml` non e la libreria. Serve solo a dire a Python come installarla.
-
-La libreria vera e qui:
+## Organizzazione
 
 ```text
 src/ragmens_core/
-  __init__.py
-  config.py
-  chunking.py
-  context.py
-  documents.py
-  index.py
-  memory.py
+  __init__.py   API pubblica
+  config.py     configurazione e validazione
+  models.py     contratto chunk
+  documents.py  conversione e loader
+  cleaning.py   pulizia strutturata
+  chunking.py   HybridChunker
+  embeddings.py SentenceTransformers e dispositivo
+  cache.py      firme e checksum
+  index.py      artefatti e collection Qdrant
+  retrieval.py  query e filtri
+  context.py    budget e citazioni
+  memory.py     memoria conversazionale
+  prompts.py    istruzioni e messaggi
+  llm.py        adapter Ollama e streaming
+  pipeline.py   orchestrazione e chiusura
+  api.py        adapter FastAPI opzionale
+  evaluation.py metriche retrieval su esempi annotati
+examples/       script e notebook dimostrativi
+tests/          test locali e integrazione facoltativa
 ```
 
-Il nome da usare negli import e:
+## Prerequisiti e installazione
 
-```python
-import ragmens_core
-```
-
-oppure:
-
-```python
-from ragmens_core import RagConfig, RagIndex
-```
-
-## 3. Uso minimo consigliato
-
-Questo e il flusso normale:
-
-```python
-from ragmens_core import RagConfig, RagIndex
-
-config = RagConfig.from_env()
-rag = RagIndex.prepare(config)
-
-domanda = "come verifico il corretto funzionamento della pompa idraulica?"
-hits = rag.retrieve(domanda, top_k=5)
-context = rag.build_context(hits)
-
-print(context)
-```
-
-## 3.1 Uso minimo consigliato con installazione da script
-
-```python
-import sys
-!{sys.executable} -m pip install git+https://github.com/matteoarutaDM/ragmens-core.git
-
-from ragmens_core import RagConfig, RagIndex
-
-config = RagConfig.from_env()
-rag = RagIndex.prepare(config)
-
-domanda = "come verifico il corretto funzionamento della pompa idraulica?"
-hits = rag.retrieve(domanda, top_k=5)
-context = rag.build_context(hits)
-
-print(context)
-```
-
-Cosa succede:
-
-1. `RagConfig.from_env()` legge configurazione e percorsi.
-2. `RagIndex.prepare(config)` carica o crea chunks e indice FAISS.
-3. `rag.retrieve(...)` cerca i chunk piu rilevanti.
-4. `rag.build_context(...)` trasforma i risultati in testo pronto per il prompt LLM.
-
-
-
-## 3.2 Uso minimo consigliato con LLM
-
-```python
-# ============================================================
-# 1) RAG CORE DA LIBRERIA
-# ============================================================
-
-from __future__ import annotations
-
-from typing import Dict, List
-
-from ragmens_core import RagConfig, RagIndex, ShortTermMemory, VectorMemory, ltm_text
-
-
-config = RagConfig.from_env()
-rag = RagIndex.prepare(config)
-stm = ShortTermMemory(max_messages=10)
-ltm = VectorMemory(
-    embedder=rag.embedder,
-    mem_dir=config.mem_dir,
-    corpus_signature=rag.corpus_signature,
-)
-
-# ============================================================
-# 2) GENERATION LLM - PROMPT COME NEL NOTEBOOK ORIGINALE
-# ============================================================
-
-from openai import OpenAI
-
-
-LLM_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
-LLM_MODEL = os.getenv("LLM_MODEL", "llama3.2")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "ollama")
-
-
-QA_PROMPT = """Sei un assistente virtuale esperto della conoscenza e conrtesto dei pdf.
-
-Personalita e stile:
-- Rispondi sempre in italiano.
-- Mantieni un tono amichevole, naturale, professionale e disponibile.
-- Se l'utente saluta, ringrazia, chiede come stai, fa conversazione generica o pone una domanda amichevole, rispondi in modo cordiale e umano, senza forzare riferimenti tecnici.
-- Non essere freddo o meccanico: usa frasi semplici, dirette e collaborative.
-- Evita risposte troppo lunghe quando la domanda e semplice.
-- Quando la domanda e tecnica, resta preciso, ordinato e concreto.
-
-Uso del contesto:
-- Usa il CONTEXT come fonte principale quando contiene informazioni rilevanti.
-- Se il CONTEXT contiene fonti, pagine o chunk utili, integra la risposta con quelle informazioni.
-- Se il CONTEXT non contiene abbastanza informazioni per rispondere completamente, non dire in modo esplicito e secco che l'informazione non e presente nel contesto.
-- In assenza di informazioni sufficienti nel CONTEXT, costruisci comunque una risposta utile basandoti sulla tua conoscenza generale, mantenendo un tono prudente e professionale.
-- Quando usi conoscenza generale non supportata direttamente dal CONTEXT, evita affermazioni troppo assolute e formula la risposta come indicazione generale.
-- Non inventare nomi di schermate, menu, percorsi, campi o configurazioni specifiche se non sono nel CONTEXT o non sono ragionevolmente noti.
-- Se una risposta richiede dati specifici dell'ambiente del cliente, spiega in modo amichevole cosa verificare o quali informazioni servirebbero.
-
-Qualita della risposta:
-- Dai prima la risposta pratica, poi eventuali dettagli.
-- Per procedure operative, usa passaggi chiari e numerati.
-- Per concetti o definizioni, usa una spiegazione breve seguita da esempi se utili.
-- Per domande ambigue, rispondi con l'interpretazione piu probabile e, se serve, chiedi una precisazione alla fine.
-- Se l'utente chiede un confronto, struttura la risposta in punti o tabella testuale semplice.
-- Se l'utente chiede una configurazione NetSuite, evidenzia prerequisiti, percorso operativo e risultato atteso quando possibile.
-- Mantieni risposte concise ma complete: evita testo superfluo, ma non omettere passaggi importanti.
-
-Citazioni e fonti:
-- Cita le fonti quando nel CONTEXT sono disponibili riferimenti a Fonte, Pagina o Chunk.
-- Non citare fonti inesistenti.
-- Se stai rispondendo a una domanda amichevole o generale non tecnica, non serve citare fonti.
-
-MEMORIA BREVE:
-{stm}
-
-MEMORIA LUNGA RILEVANTE:
-{ltm}
-
-CONTEXT:
-{context}
-
-DOMANDA:
-{question}
-
-RISPOSTA (in italiano, chiara, strutturata e professionale):"""
-
-
-def build_prompt(question: str, context: str, memory_hits: List[dict]) -> str:
-    return QA_PROMPT.format(
-        stm=stm.text(),
-        ltm=ltm_text(memory_hits),
-        context=context,
-        question=question,
-    )
-
-
-def call_llm(prompt: str) -> str:
-    client = OpenAI(api_key=OPENAI_API_KEY, base_url=LLM_BASE_URL)
-    response = client.chat.completions.create(
-        model=LLM_MODEL,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return (response.choices[0].message.content or "").strip()
-
-
-def ask(
-    question: str,
-    top_k: int | None = None,
-    document_ids: List[str] | None = None,
-    save_memory: bool = True,
-) -> Dict[str, object]:
-    hits = rag.retrieve(question, top_k=top_k, document_ids=document_ids)
-    context = rag.build_context(hits)
-    memory_hits = ltm.search(SESSION_ID, question, top_k=4)
-    prompt = build_prompt(question, context, memory_hits)
-    answer = call_llm(prompt)
-
-    stm.add("user", question)
-    stm.add("assistant", answer)
-    if save_memory:
-        ltm.add_turn(SESSION_ID, question, answer)
-
-    print("\n=== RISPOSTA ===\n")
-    print(answer)
-    print("\n=== FONTI RECUPERATE ===")
-    for hit in hits:
-        print(f"- {hit['source']} | pagina {hit['page']} | chunk {hit['chunk_index']} | score {hit['score']:.3f}")
-
-    return {
-        "question": question,
-        "answer": answer,
-        "hits": hits,
-        "context": context,
-        "memory_hits": memory_hits,
-        "prompt": prompt,
-    }
-
-
-def chat_loop() -> None:
-    print("Chat RAG pronta. Scrivi una domanda oppure 'exit' per uscire.")
-    while True:
-        question = input("\nDomanda> ").strip()
-        if question.lower() in {"exit", "quit", "q"}:
-            break
-        if question:
-            ask(question)
-
-
-print("LLM configurato:", LLM_MODEL, "@", LLM_BASE_URL)
-
-# ============================================================
-# 3) DOMANDA DI PROVA
-# ============================================================
-
-DOMANDA = """
-come verifico il corretto funzionamento della pompa idraulica?
-""".strip()
-
-risultato = ask(DOMANDA)
-risposta_llm = risultato["answer"]
-```
-
-
-
-## 4. Variabili ambiente supportate
-
-Puoi creare un file `.env` nella root del progetto.
-
-Esempio:
-
-```env
-PDF_DIR=./pdf_immagini
-INDEX_DIR=./index
-MEM_DIR=./memory
-OUTPUT_DEBUG_DIR=./outputs_debug
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-TOP_K=12
-CONTEXT_MAX_CHARS=4500
-FORCE_REBUILD_INDEX=0
-CHUNK_SIZE=1200
-CHUNK_OVERLAP=180
-MIN_CHUNK_CHARS=50
-```
-
-Significato:
-
-| Variabile | Default | A cosa serve |
-|---|---:|---|
-| `PDF_DIR` | `./pdf_immagini` | Cartella dove la libreria cerca i PDF. |
-| `INDEX_DIR` | `./index` | Cartella dove salva `chunks.jsonl`, `faiss.index`, `index_meta.json`. |
-| `MEM_DIR` | `./memory` | Cartella per la memoria conversazionale opzionale. |
-| `OUTPUT_DEBUG_DIR` | `./outputs_debug` | Cartella dove salva il testo estratto dai PDF per debug. |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2` | Modello SentenceTransformers usato per gli embedding. |
-| `TOP_K` | `12` | Numero default di risultati recuperati da `retrieve`. |
-| `CONTEXT_MAX_CHARS` | `4500` | Numero massimo default di caratteri nel contesto. |
-| `FORCE_REBUILD_INDEX` | `0` | Se `1`, ricrea sempre chunks e indice FAISS. |
-| `CHUNK_SIZE` | `1200` | Dimensione massima indicativa di ogni chunk. |
-| `CHUNK_OVERLAP` | `180` | Caratteri sovrapposti tra chunk consecutivi. |
-| `MIN_CHUNK_CHARS` | `50` | Scarta chunk piu corti di questo valore. |
-
-## 5. Import disponibili
-
-Tutti questi oggetti sono importabili direttamente da `ragmens_core`:
-
-```python
-from ragmens_core import (
-    RagConfig,
-    RagIndex,
-    ShortTermMemory,
-    VectorMemory,
-    build_context,
-    chunk_text,
-    clean_pdf_text,
-    ingest_pdfs,
-    ltm_text,
-    read_pdf_pages,
-)
-```
-
-### `RagConfig`
-
-Classe di configurazione della pipeline RAG.
-
-Import:
-
-```python
-from ragmens_core import RagConfig
-```
-
-Uso consigliato:
-
-```python
-config = RagConfig.from_env()
-```
-
-Parametri principali della classe:
-
-| Parametro | Tipo | A cosa serve |
-|---|---|---|
-| `base_dir` | `Path` | Directory base del progetto. |
-| `pdf_dir` | `Path` | Cartella PDF. |
-| `index_dir` | `Path` | Cartella dell'indice FAISS e dei chunk. |
-| `mem_dir` | `Path` | Cartella della memoria. |
-| `output_debug_dir` | `Path` | Cartella output debug testo PDF. |
-| `embedding_model` | `str` | Nome modello SentenceTransformers. |
-| `top_k` | `int` | Default per numero risultati retrieval. |
-| `context_max_chars` | `int` | Default massimo caratteri context. |
-| `force_rebuild_index` | `bool` | Forza ricostruzione indice. |
-| `chunk_size` | `int` | Dimensione chunk. |
-| `chunk_overlap` | `int` | Sovrapposizione chunk. |
-| `min_chunk_chars` | `int` | Lunghezza minima chunk valido. |
-
-Metodi e proprieta:
-
-| Nome | A cosa serve |
-|---|---|
-| `RagConfig.from_env(base_dir=None, env_file=None)` | Crea config leggendo `.env` e variabili ambiente. |
-| `config.ensure_dirs()` | Crea cartelle `index`, `memory`, `outputs_debug` se mancanti. |
-| `config.chunks_path` | Percorso `chunks.jsonl`. |
-| `config.faiss_path` | Percorso `faiss.index`. |
-| `config.index_meta_path` | Percorso `index_meta.json`. |
-
-Esempio con `.env` custom:
-
-```python
-config = RagConfig.from_env(env_file="config/.env.rag")
-```
-
-Esempio con configurazione manuale:
-
-```python
-from pathlib import Path
-from ragmens_core import RagConfig
-
-config = RagConfig(
-    base_dir=Path.cwd(),
-    pdf_dir=Path("pdf_immagini").resolve(),
-    index_dir=Path("index").resolve(),
-    mem_dir=Path("memory").resolve(),
-    output_debug_dir=Path("outputs_debug").resolve(),
-    embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-    top_k=8,
-    context_max_chars=5000,
-    chunk_size=1200,
-    chunk_overlap=180,
-    min_chunk_chars=50,
-)
-```
-
-### `RagIndex`
-
-Classe principale della libreria. Gestisce chunks, modello embedding, indice FAISS e retrieval.
-
-Import:
-
-```python
-from ragmens_core import RagIndex
-```
-
-Creazione o caricamento automatico:
-
-```python
-rag = RagIndex.prepare(config)
-```
-
-Parametri di `RagIndex.prepare`:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `config` | `RagConfig | None` | `None` | Configurazione. Se `None`, usa `RagConfig.from_env()`. |
-| `force_rebuild` | `bool | None` | `None` | Se `True`, ricrea indice. Se `None`, usa `config.force_rebuild_index`. |
-
-La libreria ricrea l'indice se:
-
-- manca `chunks.jsonl`
-- manca `faiss.index`
-- manca `index_meta.json`
-- cambia `PDF_DIR`
-- cambia modello embedding
-- vengono aggiunti, rimossi o modificati PDF
-- `FORCE_REBUILD_INDEX=1`
-
-Caricamento di un indice gia esistente:
-
-```python
-rag = RagIndex.load("index")
-```
-
-Parametri di `RagIndex.load`:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `index_dir` | `str | Path` | obbligatorio | Cartella con `chunks.jsonl` e `faiss.index`. |
-| `pdf_dir` | `str | Path | None` | `None` | Cartella PDF, se vuoi indicarla esplicitamente. |
-| `embedding_model` | `str | None` | `None` | Modello embedding. Se `None`, prova a leggerlo da `index_meta.json`. |
-
-Retrieval:
-
-```python
-hits = rag.retrieve("domanda utente", top_k=5)
-```
-
-Parametri di `retrieve`:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `query` | `str` | obbligatorio | Domanda o testo da cercare. |
-| `top_k` | `int | None` | `None` | Numero risultati. Se `None`, usa `config.top_k`. |
-| `document_ids` | `list[str] | None` | `None` | Limita la ricerca a specifici documenti. |
-
-Esempio con filtro documento:
-
-```python
-hits = rag.retrieve(
-    "pompa idraulica",
-    top_k=5,
-    document_ids=["manuale.pdf"],
-)
-```
-
-Ogni hit e un dizionario simile a:
-
-```python
-{
-    "id": "manuale.pdf::p10::c2",
-    "source": "manuale.pdf",
-    "page": 10,
-    "chunk_index": 2,
-    "text": "testo del chunk...",
-    "score": 0.72,
-}
-```
-
-Costruzione context:
-
-```python
-context = rag.build_context(hits, max_chars=3000)
-```
-
-Parametri di `build_context`:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `results` | `list[dict]` | obbligatorio | Lista di hit restituiti da `retrieve`. |
-| `max_chars` | `int | None` | `None` | Limite caratteri. Se `None`, usa `config.context_max_chars`. |
-
-### `chunk_text`
-
-Divide un testo in chunk.
-
-Import:
-
-```python
-from ragmens_core import chunk_text
-```
-
-Uso:
-
-```python
-chunks = chunk_text(
-    testo,
-    chunk_size=1200,
-    overlap=180,
-    min_chars=50,
-)
-```
-
-Parametri:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `text` | `str` | obbligatorio | Testo da dividere. |
-| `chunk_size` | `int` | `1200` | Dimensione massima indicativa del chunk. |
-| `overlap` | `int` | `180` | Caratteri ripetuti tra chunk consecutivi. |
-| `min_chars` | `int` | `50` | Scarta chunk piu corti. |
-
-### `build_context`
-
-Funzione standalone per costruire il contesto da una lista di risultati.
-
-Import:
-
-```python
-from ragmens_core import build_context
-```
-
-Uso:
-
-```python
-context = build_context(hits, max_chars=4500)
-```
-
-Parametri:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `results` | `list[dict]` | obbligatorio | Risultati retrieval. |
-| `max_chars` | `int` | `4500` | Limite massimo del contesto. |
-
-### `clean_pdf_text`
-
-Pulisce testo estratto da PDF.
-
-Import:
-
-```python
-from ragmens_core import clean_pdf_text
-```
-
-Uso:
-
-```python
-testo_pulito = clean_pdf_text(testo_grezzo)
-```
-
-Parametri:
-
-| Parametro | Tipo | A cosa serve |
-|---|---|---|
-| `text` | `str` | Testo grezzo da normalizzare. |
-
-La funzione normalizza newline, spazi e righe vuote multiple.
-
-### `read_pdf_pages`
-
-Legge un PDF e restituisce una lista di testi, uno per pagina.
-
-Import:
-
-```python
-from pathlib import Path
-from ragmens_core import read_pdf_pages
-```
-
-Uso:
-
-```python
-pages = read_pdf_pages(Path("pdf_immagini/manuale.pdf"))
-```
-
-Parametri:
-
-| Parametro | Tipo | A cosa serve |
-|---|---|---|
-| `pdf_path` | `Path` | Percorso del PDF da leggere. |
-
-### `ingest_pdfs`
-
-Funzione piu bassa di livello. Legge PDF, crea chunk e salva `chunks.jsonl`.
-
-Di solito non serve chiamarla direttamente, perche `RagIndex.prepare()` la usa in automatico.
-
-Import:
-
-```python
-from pathlib import Path
-from ragmens_core import ingest_pdfs
-```
-
-Uso:
-
-```python
-chunks = ingest_pdfs(
-    pdf_dir=Path("pdf_immagini"),
-    chunks_path=Path("index/chunks.jsonl"),
-    output_debug_dir=Path("outputs_debug"),
-    save_debug_text=True,
-    chunk_size=1200,
-    overlap=180,
-    min_chars=50,
-)
-```
-
-Parametri:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `pdf_dir` | `Path` | obbligatorio | Cartella PDF. |
-| `chunks_path` | `Path` | obbligatorio | File JSONL dove salvare i chunk. |
-| `output_debug_dir` | `Path | None` | `None` | Cartella per testo estratto dai PDF. |
-| `save_debug_text` | `bool` | `True` | Se `True`, salva testo estratto per debug. |
-| `chunk_size` | `int` | `1200` | Dimensione chunk. |
-| `overlap` | `int` | `180` | Sovrapposizione chunk. |
-| `min_chars` | `int` | `50` | Lunghezza minima chunk. |
-
-### `ShortTermMemory`
-
-Memoria breve in RAM. Utile per tenere gli ultimi messaggi nella costruzione del prompt.
-
-Import:
-
-```python
-from ragmens_core import ShortTermMemory
-```
-
-Uso:
-
-```python
-stm = ShortTermMemory(max_messages=10)
-stm.add("user", "ciao")
-stm.add("assistant", "ciao, dimmi pure")
-
-testo_memoria = stm.text(max_chars=1200)
-```
-
-Parametri costruttore:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `max_messages` | `int` | `10` | Numero massimo di messaggi mantenuti. |
-
-Metodi:
-
-| Metodo | A cosa serve |
-|---|---|
-| `add(role, content)` | Aggiunge un messaggio. |
-| `text(max_chars=1200)` | Restituisce la memoria come testo. |
-| `clear()` | Svuota la memoria. |
-
-### `VectorMemory`
-
-Memoria lunga conversazionale salvata su FAISS separato.
-
-Import:
-
-```python
-from ragmens_core import VectorMemory
-```
-
-Uso:
-
-```python
-memory = VectorMemory(
-    embedder=rag.embedder,
-    mem_dir=config.mem_dir,
-    corpus_signature=rag.corpus_signature,
-)
-
-memory.add_turn(
-    session_id="sessione-1",
-    user_text="come controllo la pompa?",
-    assistant_text="devi verificare...",
-)
-
-memory_hits = memory.search(
-    session_id="sessione-1",
-    query="pompa idraulica",
-    top_k=4,
-)
-```
-
-Parametri costruttore:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `embedder` | `SentenceTransformer` | obbligatorio | Modello embedding gia caricato, di solito `rag.embedder`. |
-| `mem_dir` | `Path` | obbligatorio | Cartella dove salvare memoria JSONL e FAISS. |
-| `corpus_signature` | `str | None` | `None` | Firma del corpus, utile per evitare memoria di PDF diversi. |
-| `jsonl_name` | `str` | `memory.jsonl` | Nome file metadati memoria. |
-| `faiss_name` | `str` | `memory.faiss` | Nome file indice memoria. |
-
-Metodi:
-
-| Metodo | A cosa serve |
-|---|---|
-| `add_turn(session_id, user_text, assistant_text)` | Salva un turno conversazionale. |
-| `search(session_id, query, top_k=4)` | Cerca ricordi rilevanti per una sessione. |
-
-### `ltm_text`
-
-Converte risultati di `VectorMemory.search()` in testo pronto per il prompt.
-
-Import:
-
-```python
-from ragmens_core import ltm_text
-```
-
-Uso:
-
-```python
-memory_hits = memory.search("sessione-1", "pompa idraulica")
-testo_memoria_lunga = ltm_text(memory_hits, max_chars=1200)
-```
-
-Parametri:
-
-| Parametro | Tipo | Default | A cosa serve |
-|---|---|---:|---|
-| `mem_hits` | `list[dict]` | obbligatorio | Risultati di `VectorMemory.search`. |
-| `max_chars` | `int` | `1200` | Limite massimo del testo generato. |
-
-## 6. Script di prova
-
-Ho aggiunto uno script semplice:
+Python 3.10 o superiore compatibile con le versioni delle dipendenze risolte da pip. Qwen3-Embedding-4B e qwen3:14b richiedono molte risorse RAM/VRAM e spazio su disco; su CPU possono essere molto lenti. Docling e SentenceTransformers possono scaricare pesi alla prima preparazione. Per la generazione serve Ollama installato e avviato separatamente:
 
 ```bash
-python3 prova_rag.py
+ollama pull qwen3:14b
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[test]'
+python -c 'from ragmens_core import RagConfig, RAGPipeline; print("import OK")'
+cp .env.example .env
 ```
 
-Lo script:
+Per l'API installare `pip install -e '.[api]'`; per notebook usare l'extra `notebook`. OCR può richiedere componenti aggiuntivi del proprio ambiente Docling. La libreria non installa né avvia Ollama o il suo modello.
 
-1. legge la configurazione
-2. prepara o carica l'indice
-3. esegue una domanda di prova
-4. stampa fonti e contesto
+## Configurazione
 
-Se non ci sono PDF in `pdf_immagini/`, avrai un errore simile:
+`RagConfig.from_env()` legge `.env`, poi le variabili ambiente, poi eventuali parametri Python espliciti. `RagConfig(...)` costruisce una configurazione indipendente. I percorsi relativi di `from_env` sono risolti rispetto alla directory corrente o a `base_dir`. Copiare `.env.example` per vedere tutte le opzioni. Non committare credenziali reali.
 
-```text
-FileNotFoundError: Nessun PDF trovato in .../pdf_immagini
-```
+| Variabile | Default | Uso e quando modificarla |
+|---|---|---|
+| PROJECT_ID | default | Identità del progetto nella firma corpus |
+| KNOWLEDGE_DIR | knowledge | Cartella documenti |
+| RAG_ARTIFACT_DIR | rag_artifacts | Artefatti e memoria, esterna al corpus |
+| FORCE_REBUILD_INDEX | 0 | 1 per forzare una nuova generazione |
+| DOCLING_OCR | 0 | 1 per PDF scansionati, con OCR disponibile |
+| ALLOW_PARTIAL | 0 | 1 per accettare conversioni parziali, segnalate nei log |
+| SAVE_RAW_JSON / SAVE_CLEAN_JSON | 1 / 1 | Conservazione dei JSON intermedi |
+| DOCLING_TABLES | 1 | Analisi struttura tabelle PDF |
+| CHUNKER | hybrid | Adapter chunking supportato |
+| MAX_CHUNK_TOKENS | 256 | Limite del tokenizer embedding, special token inclusi |
+| CHUNK_MERGE_PEERS | 1 | Unione elementi contigui |
+| CHUNK_REPEAT_TABLE_HEADER | 1 | Ripetizione intestazione tabella |
+| CHUNK_OMIT_HEADER_ON_OVERFLOW | 0 | Omissione intestazione in overflow |
+| CHUNK_ALWAYS_EMIT_HEADINGS | 0 | Emissione autonoma dei titoli |
+| EMBEDDING_MODEL | Qwen/Qwen3-Embedding-4B | Modello e tokenizer di indicizzazione |
+| EMBEDDING_BATCH_SIZE | 8 | Ridurre se manca memoria |
+| EMBEDDING_MAX_SEQ_LENGTH | 512 | Limite sequenza embedding |
+| EMBEDDING_DEVICE | auto | auto, cpu, cuda o mps |
+| VECTOR_DB | qdrant | Database supportato |
+| QDRANT_MODE | local | local o remote |
+| QDRANT_PATH | rag_artifacts/qdrant | Database locale |
+| QDRANT_COLLECTION | documents | Prefisso collection per firma e generazione |
+| QDRANT_URL / QDRANT_API_KEY | vuoto | Endpoint remoto e chiave facoltativa |
+| TOP_K | 5 | Numero risultati retrieval |
+| QUERY_INSTRUCTION | Given a question, retrieve relevant passages from documents that answer the question. | Istruzione Qwen per query |
+| LLM_PROVIDER | ollama | Provider supportato |
+| OLLAMA_MODEL | qwen3:14b | Modello generativo già disponibile |
+| OLLAMA_BASE_URL | http://localhost:11434 | Endpoint Ollama |
+| LLM_TEMPERATURE | 0.15 | Temperatura |
+| LLM_NUM_CTX | 16384 | Finestra configurata per Ollama |
+| LLM_NUM_PREDICT | 3500 | Numero massimo token generati |
+| LLM_REPEAT_PENALTY | 1.08 | Penalità ripetizione |
+| LLM_TIMEOUT | 120 | Timeout in secondi |
+| USE_MEMORY | 0 | 1 per abilitare la memoria |
+| SESSION_ID | default | Identità conversazione |
+| MEMORY_RECENT_TURNS | 6 | Numero turni recenti |
+| MEMORY_RETRIEVAL_TOP_K | 3 | Numero ricordi semantici |
+| MEMORY_MAX_CHARS | 4000 | Limite caratteri memoria |
+| CONTEXT_MAX_TOKENS | 8000 | Budget stimato contesto documentale |
+| CONTEXT_MAX_CHARS | 30000 | Limite aggiuntivo in caratteri |
+| SYSTEM_RESERVE_TOKENS | 1500 | Spazio riservato alle istruzioni |
+| MEMORY_RESERVE_TOKENS | 1000 | Spazio riservato alla memoria |
+| RESPONSE_RESERVE_TOKENS | 3500 | Spazio riservato alla generazione |
 
-In quel caso metti i PDF nella cartella `pdf_immagini/` oppure imposta `PDF_DIR` nel file `.env`.
+## Documenti e indicizzazione
 
-## 7. Esempio completo con LLM esterno
+Inserire PDF, TXT, Markdown, CSV, JSON e JSONL UTF-8 in `knowledge/`. JSON è serializzato interamente, CSV per riga, JSONL per record. I PDF testuali passano a `DocumentConverter`; per PDF scansionati abilitare OCR e installarne i requisiti. Conversioni fallite vengono segnalate e saltate; quelle parziali sono rifiutate salvo `ALLOW_PARTIAL=1`.
 
-La libreria restituisce il `context`; poi lo usi nel tuo prompt.
+La preparazione salva JSON originali e puliti, chunk contestualizzati, embedding NumPy e metadati. La pulizia interessa i campi `text` dei testi e delle celle tabellari, senza modificare riferimenti e coordinate. Il tokenizer Qwen sostituisce quello MiniLM del riferimento. Se dopo la contestualizzazione un chunk supera il limite, viene suddiviso in segmenti consecutivi senza scartare testo; ciascuno conserva i metadati di provenienza del chunk originale.
+
+## Retrieval senza LLM
 
 ```python
-from ragmens_core import RagConfig, RagIndex
-
-config = RagConfig.from_env()
-rag = RagIndex.prepare(config)
-
-question = "come verifico la pompa idraulica?"
-hits = rag.retrieve(question, top_k=5)
-context = rag.build_context(hits)
-
-prompt = f"""
-Usa il seguente contesto per rispondere.
-
-CONTESTO:
-{context}
-
-DOMANDA:
-{question}
-"""
-
-# Qui chiami il tuo LLM: OpenAI, Ollama, FastAPI, ecc.
+from ragmens_core import RagConfig, RAGPipeline
+with RAGPipeline.prepare(RagConfig.from_env()) as rag:
+    result = rag.preview('Quali sono le conclusioni principali?')
+    print(result['context'])
+    print(result['sources'])
 ```
 
-## 8. Quando ricreare l'indice
+`preview()` non chiama Ollama. Il modello embedding è necessario. `sources=['cartella/documento.pdf']` filtra per percorso relativo esatto prima del ranking. Gli score coseno non sono probabilità.
 
-Normalmente non devi pensarci: `RagIndex.prepare()` decide da solo se ricrearlo.
+## RAG + LLM e streaming
 
-Per forzare manualmente:
+Con Ollama avviato e il modello già scaricato:
+
+```python
+from ragmens_core import RAGPipeline
+with RAGPipeline.prepare() as rag:
+    result = rag.ask('Quali sono le conclusioni principali?')
+    print(result['answer'])
+    print(result['sources'])
+    for pezzo in rag.ask_stream('Quali limiti presentano?'):
+        print(pezzo, end='', flush=True)
+```
+
+`ask()` restituisce domanda, risposta, risultati, contesto, fonti incluse, risultati esclusi, troncamento e messaggi. Lo streaming esegue una ricerca e una richiesta; il turno viene salvato solo al completamento dell'iterazione. Le citazioni `[FONTE N]` corrispondono alle fonti effettivamente incluse nel prompt, ma non verificano la veridicità della risposta.
+
+## Memoria
+
+Con `USE_MEMORY=1` i turni vengono salvati in JSONL e quelli recenti mantenuti in RAM; un prodotto scalare NumPy recupera semanticamente i turni precedenti, separatamente dall'indice documentale. Le memorie sono isolate per sessione, firma corpus e filtro fonti. Le risposte precedenti non sono fonti documentali. Il retrieval usa la domanda originale: i follow-up ambigui possono richiedere in futuro un query rewriter.
+
+## Budget, cache e Qdrant
+
+Il budget usa il numero di byte UTF-8 come stima prudente dei token: non è un conteggio esatto Ollama e non include necessariamente tutte le particolarità del template di chat. Sono riservati spazi configurabili per sistema, memoria e risposta; il prompt stimato troppo grande genera un errore. Tarare i limiti sul modello effettivo.
+
+La firma SHA-256 include contenuto e percorso dei documenti, progetto, modello, configurazione Docling/chunking e versioni dipendenze. Sotto `rag_artifacts/indexes/<firma>/generations/` ogni generazione contiene JSON, `chunks.jsonl`, `embeddings.npy`, `embedding_metadata.jsonl`, `manifest.json` e `index_meta.json`. Un puntatore viene aggiornato dopo la verifica. Checksum, vettori, payload, dimensioni e numero punti sono controllati alla riapertura. Una modifica del corpus o parametri cambia firma; una cache corrotta viene ricostruita. `FORCE_REBUILD_INDEX=1` forza una nuova generazione. Le versioni e collection precedenti non vengono cancellate automaticamente.
+
+Qdrant locale richiede accesso esclusivo al percorso: chiudere la pipeline (`close()` o context manager) prima di riaprirlo in un altro processo. Modalità remota: `QDRANT_MODE=remote` e `QDRANT_URL`. Ogni generazione usa una collection dedicata; se esistono collection incompatibili non vengono sovrascritte.
+
+## Personalizzazione e riutilizzo
+
+Installare da un altro progetto con `pip install -e /percorso/ragmens` e importare `ragmens_core` in uno script o notebook. `RagConfig.from_env(embedding_model='...', ollama_model='...', top_k=3)` modifica le impostazioni. `RAGPipeline.prepare(config, system_prompt='...')` sostituisce il prompt. Gli adapter di formati testuali si registrano in `LOADERS` e restituiscono coppie `(testo, posizione)`; dopo cambiamenti alla logica documentale aggiornare `PIPELINE_VERSION` in `cache.py`.
+
+## FastAPI opzionale
+
+L'applicazione ospitante può creare una pipeline una sola volta e passare l'istanza a `ragmens_core.api.create_app(rag)`. Espone `GET /health` e `POST /chat` con JSON `{"question": "...", "stream": true}`; il ciclo di vita chiude la pipeline. Per avviarla creare un modulo applicativo con `app = create_app(RAGPipeline.prepare())`, poi eseguire `uvicorn nome_modulo:app`. Proteggere l'API prima di esporla pubblicamente: autenticazione e gestione concorrente multiutente non sono incluse.
+
+## Migrazione e troubleshooting
+
+Gli indici FAISS/MiniLM precedenti non sono compatibili: mantenere i documenti e ricostruire con la nuova configurazione. `RagConfig` è un alias di `Config`, `RagIndex` di `RAGState`, ma la vecchia costruzione e le vecchie API `ShortTermMemory`, `VectorMemory`, `chunk_text` e `ingest_pdfs` non sono compatibili. Usare `RAGPipeline.prepare`, `preview` e `ask`.
+
+Se l'import fallisce, installare nel Python del kernel corretto. Per modello embedding non disponibile verificare accesso ai pesi e dipendenze; se la GPU esaurisce memoria ridurre batch o scegliere CPU. Per Ollama verificare servizio, URL e `ollama pull qwen3:14b`. Una collection incompatibile o incompleta genera ricostruzione; chiudere altri processi che occupano il database locale. Se non si trovano documenti verificare `KNOWLEDGE_DIR`; PDF senza testo possono richiedere OCR. Una cache corrotta viene ricostruita. Errori di lunghezza tokenizer richiedono riduzione di `MAX_CHUNK_TOKENS`; per prompt troppo grandi ridurre budget, memoria o testo aggiuntivo.
+
+## Test e limiti
 
 ```bash
-FORCE_REBUILD_INDEX=1 python3 prova_rag.py
+python -m pytest -q
+RAG_RUN_INTEGRATION=1 python -m pytest -m integration -q
 ```
 
-Oppure da codice:
+Il secondo comando richiede documenti, pesi e Ollama reali; i test standard usano sostituti leggeri e non dimostrano la qualità dei modelli. Non sono implementati ricerca ibrida, BM25, reranking, GraphRAG, aggiornamento incrementale, gestione concorrente multiutente o verifica automatica della veridicità. Non è disponibile un dataset di benchmark: accuratezza e prestazioni devono essere misurate su dati di riferimento propri. Per valutare il retrieval:
 
 ```python
-rag = RagIndex.prepare(config, force_rebuild=True)
+from ragmens_core.evaluation import evaluate_retrieval
+cases = [{'question': 'Quali conclusioni?', 'expected_sources': ['documento.pdf']}]
+with RAGPipeline.prepare() as rag:
+    print(evaluate_retrieval(rag, cases, top_k=5))
 ```
 
-## 9. File generati
-
-Dentro `INDEX_DIR`:
-
-```text
-index/
-  chunks.jsonl
-  faiss.index
-  index_meta.json
-```
-
-Dentro `MEM_DIR`, se usi `VectorMemory`:
-
-```text
-memory/
-  memory.jsonl
-  memory.faiss
-```
-
-Dentro `OUTPUT_DEBUG_DIR`:
-
-```text
-outputs_debug/
-  nome_pdf_all_pages.txt
-```
-
-Questi file sono dati generati, non codice sorgente.
-
-# ragmens-core
+La funzione restituisce Recall@K, Hit Rate@K, MRR e tempo medio, calcolati sulle fonti attese fornite.

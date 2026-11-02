@@ -7,3 +7,11 @@ index/
 memory/
 outputs_debug/
 
+.env
+.rag_artifacts/
+.pytest_cache/
+build/
+dist/
+.ipynb_checkpoints/
+
+rag_artifacts/

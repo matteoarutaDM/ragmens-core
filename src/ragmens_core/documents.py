@@ -1,78 +1,51 @@
+"""Conversione Docling e adapter per formati testuali."""
 from __future__ import annotations
-
-import json
-import re
+import csv, json, logging
 from pathlib import Path
+from typing import Callable
+from ragmens_core.cleaning import clean_text
+logger = logging.getLogger(__name__)
 
-from pypdf import PdfReader
-from tqdm.auto import tqdm
+def load_text(path): return [(path.read_text(encoding='utf-8-sig'), 'documento')]
+def load_json(path): return [(json.dumps(json.loads(path.read_text(encoding='utf-8-sig')),ensure_ascii=False,indent=2),'documento')]
+def load_jsonl(path): return [(json.dumps(json.loads(line),ensure_ascii=False),f'record {i}') for i,line in enumerate(path.read_text(encoding='utf-8-sig').splitlines(),1) if line.strip()]
+def load_csv(path):
+    with path.open(encoding='utf-8-sig',newline='') as f: return [(json.dumps(row,ensure_ascii=False),f'riga {i}') for i,row in enumerate(csv.DictReader(f),2)]
+LOADERS: dict[str,Callable] = {'.txt':load_text,'.md':load_text,'.json':load_json,'.jsonl':load_jsonl,'.csv':load_csv}
 
-from ragmens_core.chunking import chunk_text
+def source_files(root: Path) -> list[Path]:
+    if not root.is_dir(): raise FileNotFoundError(f'Creare la cartella {root}')
+    files = sorted(p for p in root.rglob('*') if p.is_file() and (p.suffix.lower() == '.pdf' or p.suffix.lower() in LOADERS))
+    if not files: raise ValueError('Nessun documento supportato')
+    return files
 
-
-def clean_pdf_text(text: str) -> str:
-    text = text or ""
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def read_pdf_pages(pdf_path: Path) -> list[str]:
-    reader = PdfReader(str(pdf_path))
-    return [clean_pdf_text(page.extract_text() or "") for page in reader.pages]
-
-
-def ingest_pdfs(
-    pdf_dir: Path,
-    chunks_path: Path,
-    output_debug_dir: Path | None = None,
-    save_debug_text: bool = True,
-    chunk_size: int = 1200,
-    overlap: int = 180,
-    min_chars: int = 50,
-) -> list[dict]:
-    pdf_files = sorted(pdf_dir.rglob("*.pdf"))
-    if not pdf_files:
-        raise FileNotFoundError(f"Nessun PDF trovato in {pdf_dir}")
-
-    all_chunks: list[dict] = []
-    if save_debug_text and output_debug_dir:
-        output_debug_dir.mkdir(parents=True, exist_ok=True)
-
-    for pdf_path in tqdm(pdf_files, desc="Ingestione PDF"):
-        source_name = str(pdf_path.relative_to(pdf_dir))
-        pages = read_pdf_pages(pdf_path)
-
-        if save_debug_text and output_debug_dir:
-            debug_name = source_name.replace("/", "__")
-            debug_path = output_debug_dir / f"{Path(debug_name).stem}_all_pages.txt"
-            with debug_path.open("w", encoding="utf-8") as out:
-                for page_num, page_text in enumerate(pages, start=1):
-                    out.write(page_text)
-                    out.write("\n\n" + "-" * 40 + f" [FINE PAGINA {page_num}] " + "-" * 40 + "\n\n")
-
-        for page_num, page_text in enumerate(pages, start=1):
-            for chunk_index, chunk in enumerate(
-                chunk_text(page_text, chunk_size=chunk_size, overlap=overlap, min_chars=min_chars)
-            ):
-                all_chunks.append(
-                    {
-                        "id": f"{source_name}::p{page_num}::c{chunk_index}",
-                        "source": source_name,
-                        "page": page_num,
-                        "chunk_index": chunk_index,
-                        "text": chunk,
-                    }
-                )
-
-    if not all_chunks:
-        raise RuntimeError("Nessun chunk valido estratto dai PDF.")
-
-    chunks_path.parent.mkdir(parents=True, exist_ok=True)
-    with chunks_path.open("w", encoding="utf-8") as handle:
-        for chunk in all_chunks:
-            handle.write(json.dumps(chunk, ensure_ascii=False) + "\n")
-
-    return all_chunks
-
+def convert_documents(files, config, converter=None):
+    from docling_core.types.doc import DoclingDocument, DocItemLabel
+    pdfs = [p for p in files if p.suffix.lower() == '.pdf']
+    if pdfs and converter is None:
+        from docling.document_converter import DocumentConverter, PdfFormatOption
+        from docling.datamodel.base_models import InputFormat
+        from docling.datamodel.pipeline_options import PdfPipelineOptions
+        opts = PdfPipelineOptions(do_ocr=config.docling_ocr, do_table_structure=config.docling_tables)
+        converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
+    converted = []
+    if pdfs:
+        from docling.datamodel.base_models import ConversionStatus
+        for result in converter.convert_all(pdfs, raises_on_error=False):
+            source = Path(result.input.file).resolve().relative_to(config.knowledge_dir).as_posix()
+            if result.status == ConversionStatus.FAILURE or (result.status == ConversionStatus.PARTIAL_SUCCESS and not config.allow_partial):
+                logger.warning('Conversione rifiutata %s: %s', source, result.errors)
+                continue
+            if result.status == ConversionStatus.PARTIAL_SUCCESS: logger.warning('Conversione parziale accettata: %s', source)
+            converted.append((source,result.document))
+    for path in files:
+        if path.suffix.lower() == '.pdf': continue
+        source = path.relative_to(config.knowledge_dir).as_posix()
+        try:
+            doc = DoclingDocument(name=source)
+            for text, location in LOADERS[path.suffix.lower()](path):
+                if clean_text(text): doc.add_text(label=DocItemLabel.TEXT, text=text, orig=location)
+            converted.append((source,doc))
+        except (OSError,ValueError,UnicodeError) as exc: logger.warning('Conversione fallita %s: %s',source,exc)
+    if not converted: raise ValueError('Nessun documento convertito')
+    return converted
